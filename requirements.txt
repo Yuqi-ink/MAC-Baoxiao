@@ -1,0 +1,5 @@
+# 与 requirements.txt 一致；部署时可指定本文件或 requirements.txt 作为依赖清单
+streamlit>=1.28.0
+openpyxl>=3.1.0
+Pillow>=10.0.0
+pypdf>=4.0.0
