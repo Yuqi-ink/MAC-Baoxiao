@@ -2,7 +2,6 @@ import hashlib
 import io
 import os
 import re
-import tempfile
 import zipfile
 
 import streamlit as st
@@ -29,27 +28,6 @@ INV_CAT_INSURANCE = "保险发票"
 INV_CAT_OTHER = "其他支出发票"
 
 # --- 工具函数 ---
-
-
-def excel_to_pdf(excel_path, pdf_path):
-    pythoncom.CoInitialize()
-    excel = None
-    try:
-        excel = win32com.client.DispatchEx("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        wb = excel.Workbooks.Open(excel_path)
-        wb.ExportAsFixedFormat(0, pdf_path)
-        wb.Close()
-    except Exception as e:
-        st.error(f"PDF转换失败: {e}")
-    finally:
-        if excel is not None:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-        pythoncom.CoUninitialize()
 
 
 def safe_write(sheet, cell_coord, value):
@@ -120,33 +98,48 @@ def other_expense_stem_inputs(files, key_prefix: str) -> list[str]:
 
 
 def image_bytes_to_pdf_bytes(data: bytes) -> bytes:
-    im = Image.open(io.BytesIO(data)).convert("RGB")
-    out = io.BytesIO()
-    im.save(out, format="PDF")
-    return out.getvalue()
+    src = io.BytesIO(data)
+    im = Image.open(src)
+    try:
+        im = im.convert("RGB")
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS  # Pillow < 9.1
+        im.thumbnail((1600, 1600), resample)
+        out = io.BytesIO()
+        im.save(out, format="PDF")
+        return out.getvalue()
+    finally:
+        im.close()
 
 
-def merge_files_to_pdf(file_tuples: list[tuple[bytes, str]], out_path: str) -> None:
-    """file_tuples: (raw_bytes, original_filename) 用于判断扩展名。"""
+def merge_files_to_pdf(
+    file_tuples: list[tuple[bytes, str]], out: io.BytesIO
+) -> None:
+    """将 PNG/JPG 等图片与 PDF 合并为单个 PDF，写入 out（合并后 out 位于末尾，调用方可 getvalue 或 seek(0)）。"""
     writer = PdfWriter()
+    readers_keepalive: list[PdfReader] = []
     if not file_tuples:
         writer.add_blank_page(width=595, height=842)
-        with open(out_path, "wb") as f:
-            writer.write(f)
+        writer.write(out)
         return
     for data, fname in file_tuples:
         ext = os.path.splitext(fname)[1].lower()
         if ext == ".pdf":
-            reader = PdfReader(io.BytesIO(data), strict=False)
+            buf = io.BytesIO(data)
+            reader = PdfReader(buf, strict=False)
+            readers_keepalive.append(reader)
             for page in reader.pages:
                 writer.add_page(page)
         else:
             part = image_bytes_to_pdf_bytes(data)
-            reader = PdfReader(io.BytesIO(part), strict=False)
+            buf = io.BytesIO(part)
+            reader = PdfReader(buf, strict=False)
+            readers_keepalive.append(reader)
             for page in reader.pages:
                 writer.add_page(page)
-    with open(out_path, "wb") as f:
-        writer.write(f)
+    writer.write(out)
 
 
 def sync_task_text_area_travelers(travelers: list[tuple[str, str]]) -> None:
@@ -198,7 +191,7 @@ div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] small {
 .stFileUploader label p {
     font-size: 1.35rem !important;
     font-weight: 600 !important;
-    line-height: 1.5 !important;
+    line-height: 1.4 !important;
 }
 </style>
 """,
@@ -580,162 +573,143 @@ if st.button("开始生成报销材料包", use_container_width=True):
         st.error(f"未找到模板文件：{template_path}")
         st.stop()
 
-    _sid_tag = sanitize_path_component(sid)
-    if has_peer:
-        _sid_tag = f"{_sid_tag}_{sanitize_path_component(sid2)}"
     _name_tag = sanitize_path_component(combined_display_name(name, name2, has_peer))
-    temp_excel = os.path.abspath(f"temp_wuding_{_sid_tag}.xlsx")
-    temp_wuding_pdf = os.path.abspath(f"厦门大学出差五定审批表_{_name_tag}.pdf")
-    temp_merged_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-    temp_inner_zip_path = tempfile.NamedTemporaryFile(suffix=".zip", delete=False).name
-    temp_outer_zip_path = tempfile.NamedTemporaryFile(suffix=".zip", delete=False).name
 
-    try:
-        wb = load_workbook(template_path)
-        ws = wb.active
-        _travelers_excel: list[tuple[str, str]] = (
-            [(name, sid), (name2, sid2)] if has_peer else [(name, sid)]
-        )
-        safe_write(ws, "C6", combined_display_name(name, name2, has_peer))
-        safe_write(ws, "E6", duty)
-        safe_write(ws, "G6", dest)
-        safe_write(ws, "G7", transport_for_excel)
-        if len(dates) == 2:
-            safe_write(ws, "G5", str(dates[0]))
-            safe_write(ws, "H5", str(dates[1]))
-        safe_write(ws, "G8", build_task_for_excel(task, _travelers_excel))
-        wb.save(temp_excel)
+    wb = load_workbook(template_path)
+    ws = wb.active
+    _travelers_excel: list[tuple[str, str]] = (
+        [(name, sid), (name2, sid2)] if has_peer else [(name, sid)]
+    )
+    safe_write(ws, "C6", combined_display_name(name, name2, has_peer))
+    safe_write(ws, "E6", duty)
+    safe_write(ws, "G6", dest)
+    safe_write(ws, "G7", transport_for_excel)
+    if len(dates) == 2:
+        safe_write(ws, "G5", str(dates[0]))
+        safe_write(ws, "H5", str(dates[1]))
+    safe_write(ws, "G8", build_task_for_excel(task, _travelers_excel))
+    excel_buf = io.BytesIO()
+    wb.save(excel_buf)
+    excel_bytes = excel_buf.getvalue()
+    excel_buf.close()
 
-        with st.spinner("正在生成五定表 PDF…"):
-            excel_to_pdf(temp_excel, temp_wuding_pdf)
-        if not os.path.isfile(temp_wuding_pdf):
-            st.stop()
+    proof_merge_sequence: list[tuple[bytes, str]] = []
+    for f in pt_list_p1:
+        proof_merge_sequence.append((f.getvalue(), f.name))
+    for f in pt_list_p2:
+        proof_merge_sequence.append((f.getvalue(), f.name))
+    for f in pho_list:
+        proof_merge_sequence.append((f.getvalue(), f.name))
+    for f in php_list:
+        proof_merge_sequence.append((f.getvalue(), f.name))
+    for f in phb_list:
+        proof_merge_sequence.append((f.getvalue(), f.name))
+    for f in pp_list:
+        proof_merge_sequence.append((f.getvalue(), f.name))
+    for f in po_list:
+        proof_merge_sequence.append((f.getvalue(), f.name))
 
-        proof_merge_sequence: list[tuple[bytes, str]] = []
-        for f in pt_list_p1:
-            proof_merge_sequence.append((f.getvalue(), f.name))
-        for f in pt_list_p2:
-            proof_merge_sequence.append((f.getvalue(), f.name))
-        for f in pho_list:
-            proof_merge_sequence.append((f.getvalue(), f.name))
-        for f in php_list:
-            proof_merge_sequence.append((f.getvalue(), f.name))
-        for f in phb_list:
-            proof_merge_sequence.append((f.getvalue(), f.name))
-        for f in pp_list:
-            proof_merge_sequence.append((f.getvalue(), f.name))
-        for f in po_list:
-            proof_merge_sequence.append((f.getvalue(), f.name))
+    merged_pdf_buf = io.BytesIO()
+    with st.spinner("正在合并证明材料为 PDF…"):
+        merge_files_to_pdf(proof_merge_sequence, merged_pdf_buf)
+    merged_pdf_bytes = merged_pdf_buf.getvalue()
+    merged_pdf_buf.close()
 
-        with st.spinner("正在合并证明材料为 PDF…"):
-            merge_files_to_pdf(proof_merge_sequence, temp_merged_pdf)
+    start_str = dates[0].isoformat()
+    _combo = combined_display_name(name, name2, has_peer)
+    inner_zip_entry_name = travel_fee_bundle_zip_name(dates[0], _combo, dest)
+    wuding_xlsx_arc = f"厦门大学出差五定审批表_{_name_tag}.xlsx"
+    outer_zip_download_name = (
+        f"报销材料_{sanitize_path_component(_combo)}_{sanitize_path_component(dest)}_{start_str}.zip"
+    )
 
-        start_str = dates[0].isoformat()
-        _combo = combined_display_name(name, name2, has_peer)
-        inner_zip_entry_name = travel_fee_bundle_zip_name(dates[0], _combo, dest)
-        wuding_xlsx_arc = f"厦门大学出差五定审批表_{_name_tag}.xlsx"
-        wuding_pdf_arc = os.path.basename(temp_wuding_pdf)
-        outer_zip_download_name = (
-            f"报销材料_{sanitize_path_component(_combo)}_{sanitize_path_component(dest)}_{start_str}.zip"
-        )
+    inner_zip_buf = io.BytesIO()
+    with zipfile.ZipFile(inner_zip_buf, "w", zipfile.ZIP_DEFLATED) as zin:
+        zin.writestr(wuding_xlsx_arc, excel_bytes)
+        if inv_out_p1:
+            arc = invoice_flat_filename(
+                start_str, dest, name, INV_CAT_OUT, inv_out_p1.name
+            )
+            zin.writestr(arc, inv_out_p1.getvalue())
+        if has_peer and inv_out_p2:
+            arc = invoice_flat_filename(
+                start_str, dest, name2, INV_CAT_OUT, inv_out_p2.name
+            )
+            zin.writestr(arc, inv_out_p2.getvalue())
+        for i, inv_hotel_f in enumerate(hotel_inv_list, start=1):
+            arc = invoice_flat_filename(
+                start_str,
+                dest,
+                _combo,
+                INV_CAT_HOTEL,
+                inv_hotel_f.name,
+                multi_index=i if len(hotel_inv_list) > 1 else None,
+            )
+            zin.writestr(arc, inv_hotel_f.getvalue())
+        if inv_return_p1:
+            arc = invoice_flat_filename(
+                start_str, dest, name, INV_CAT_RETURN, inv_return_p1.name
+            )
+            zin.writestr(arc, inv_return_p1.getvalue())
+        if has_peer and inv_return_p2:
+            arc = invoice_flat_filename(
+                start_str, dest, name2, INV_CAT_RETURN, inv_return_p2.name
+            )
+            zin.writestr(arc, inv_return_p2.getvalue())
+        for i, ins_f in enumerate(ins_list_p1, start=1):
+            arc = invoice_flat_filename(
+                start_str,
+                dest,
+                name,
+                INV_CAT_INSURANCE,
+                ins_f.name,
+                multi_index=i if len(ins_list_p1) > 1 else None,
+            )
+            zin.writestr(arc, ins_f.getvalue())
+        for i, ins_f in enumerate(ins_list_p2, start=1):
+            arc = invoice_flat_filename(
+                start_str,
+                dest,
+                name2,
+                INV_CAT_INSURANCE,
+                ins_f.name,
+                multi_index=i if len(ins_list_p2) > 1 else None,
+            )
+            zin.writestr(arc, ins_f.getvalue())
+        for i, oth_f in enumerate(other_inv_list, start=1):
+            stem_edit = (
+                other_inv_stems[i - 1]
+                if i <= len(other_inv_stems)
+                else os.path.splitext(oth_f.name)[0]
+            )
+            label = (stem_edit or "").strip() or None
+            arc = invoice_flat_filename(
+                start_str,
+                dest,
+                _combo,
+                INV_CAT_OTHER,
+                oth_f.name,
+                multi_index=i if label is None and len(other_inv_list) > 1 else None,
+                file_label=label,
+            )
+            zin.writestr(arc, oth_f.getvalue())
+    inner_zip_bytes = inner_zip_buf.getvalue()
+    inner_zip_buf.close()
 
-        with zipfile.ZipFile(temp_inner_zip_path, "w", zipfile.ZIP_DEFLATED) as zin:
-            zin.write(temp_excel, arcname=wuding_xlsx_arc)
-            if inv_out_p1:
-                arc = invoice_flat_filename(
-                    start_str, dest, name, INV_CAT_OUT, inv_out_p1.name
-                )
-                zin.writestr(arc, inv_out_p1.getvalue())
-            if has_peer and inv_out_p2:
-                arc = invoice_flat_filename(
-                    start_str, dest, name2, INV_CAT_OUT, inv_out_p2.name
-                )
-                zin.writestr(arc, inv_out_p2.getvalue())
-            for i, f in enumerate(hotel_inv_list, start=1):
-                arc = invoice_flat_filename(
-                    start_str,
-                    dest,
-                    _combo,
-                    INV_CAT_HOTEL,
-                    f.name,
-                    multi_index=i if len(hotel_inv_list) > 1 else None,
-                )
-                zin.writestr(arc, f.getvalue())
-            if inv_return_p1:
-                arc = invoice_flat_filename(
-                    start_str, dest, name, INV_CAT_RETURN, inv_return_p1.name
-                )
-                zin.writestr(arc, f.getvalue())
-            if has_peer and inv_return_p2:
-                arc = invoice_flat_filename(
-                    start_str, dest, name2, INV_CAT_RETURN, inv_return_p2.name
-                )
-                zin.writestr(arc, inv_return_p2.getvalue())
-            for i, f in enumerate(ins_list_p1, start=1):
-                arc = invoice_flat_filename(
-                    start_str,
-                    dest,
-                    name,
-                    INV_CAT_INSURANCE,
-                    f.name,
-                    multi_index=i if len(ins_list_p1) > 1 else None,
-                )
-                zin.writestr(arc, f.getvalue())
-            for i, f in enumerate(ins_list_p2, start=1):
-                arc = invoice_flat_filename(
-                    start_str,
-                    dest,
-                    name2,
-                    INV_CAT_INSURANCE,
-                    f.name,
-                    multi_index=i if len(ins_list_p2) > 1 else None,
-                )
-                zin.writestr(arc, f.getvalue())
-            for i, f in enumerate(other_inv_list, start=1):
-                stem_edit = (
-                    other_inv_stems[i - 1]
-                    if i <= len(other_inv_stems)
-                    else os.path.splitext(f.name)[0]
-                )
-                label = (stem_edit or "").strip() or None
-                arc = invoice_flat_filename(
-                    start_str,
-                    dest,
-                    _combo,
-                    INV_CAT_OTHER,
-                    f.name,
-                    multi_index=i if label is None and len(other_inv_list) > 1 else None,
-                    file_label=label,
-                )
-                zin.writestr(arc, f.getvalue())
+    outer_zip_buf = io.BytesIO()
+    with zipfile.ZipFile(outer_zip_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        zout.writestr(inner_zip_entry_name, inner_zip_bytes)
+        zout.writestr(wuding_xlsx_arc, excel_bytes)
+        zout.writestr("证明材料汇总.pdf", merged_pdf_bytes)
+    outer_bytes = outer_zip_buf.getvalue()
+    outer_zip_buf.close()
 
-        with zipfile.ZipFile(temp_outer_zip_path, "w", zipfile.ZIP_DEFLATED) as zout:
-            zout.write(temp_inner_zip_path, arcname=inner_zip_entry_name)
-            zout.write(temp_wuding_pdf, arcname=wuding_pdf_arc)
-            zout.write(temp_merged_pdf, arcname="证明材料汇总.pdf")
-
-        with open(temp_outer_zip_path, "rb") as f:
-            outer_bytes = f.read()
-
-        st.success(
-            f"处理完成。总包内含：① {inner_zip_entry_name}（电子发票 + 五定表 Excel）② {wuding_pdf_arc} ③ 证明材料汇总.pdf"
-        )
-        st.download_button(
-            label=f"下载打包：{outer_zip_download_name}",
-            data=outer_bytes,
-            file_name=outer_zip_download_name,
-            mime="application/zip",
-        )
-    finally:
-        for p in (
-            temp_excel,
-            temp_wuding_pdf,
-            temp_merged_pdf,
-            temp_inner_zip_path,
-            temp_outer_zip_path,
-        ):
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+    st.success(
+        f"处理完成。总包内含：① {inner_zip_entry_name}（电子发票与五定表 Excel 子压缩包）② {wuding_xlsx_arc}（填好的五定表 Excel）③ 证明材料汇总.pdf"
+    )
+    st.download_button(
+        label=f"下载打包：{outer_zip_download_name}",
+        data=outer_bytes,
+        file_name=outer_zip_download_name,
+        mime="application/zip",
+    )
