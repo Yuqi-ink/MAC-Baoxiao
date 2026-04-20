@@ -196,9 +196,9 @@ div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] small {
     font-size: 0.92rem !important;
 }
 .stFileUploader label p {
-    font-size: 2.5rem !important;
-    font-weight: 800 !important;
-    line-height: 1.8 !important;
+    font-size: 1.35rem !important;
+    font-weight: 600 !important;
+    line-height: 1.5 !important;
 }
 </style>
 """,
