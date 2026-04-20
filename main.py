@@ -5,9 +5,7 @@ import re
 import tempfile
 import zipfile
 
-import pythoncom
 import streamlit as st
-import win32com.client
 from openpyxl import load_workbook
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
